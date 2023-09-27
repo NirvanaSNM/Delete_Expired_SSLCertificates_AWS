@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Template for Lambda to remove expired certificates
+Resources:
+  LambdaACMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: acm-admin-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - elasticloadbalancing:RemoveListenerCertificates
+                  - elasticloadbalancing:DescribeListenerCertificates
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeListeners
+                  - sns:ListTopics
+                  - sns:Publish
+                  - sns:GetTopicAttributes
+                  - lambda:InvokeFunction
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: "arn:aws:iam::*:role/aws-service-role/acm.amazonaws.com/AWSServiceRoleForCertificateManager*"
+                Condition:
+                  StringEquals:
+                    "iam:AWSServiceName": "acm.amazonaws.com"
+              - Effect: Allow
+                Action:
+                  - iam:DeleteServiceLinkedRole
+                  - iam:GetServiceLinkedRoleDeletionStatus
+                  - iam:GetRole
+                Resource: "arn:aws:iam::*:role/aws-service-role/acm.amazonaws.com/AWSServiceRoleForCertificateManager*"
+  DetachExpiredCerts: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import botocore
+
+          def lambda_handler(event, context):
+              session = boto3.Session()
+              regions = session.get_available_regions('acm')
+              expired_certs = []
+
+              for region in regions:
+                  expired_certs.clear()
+
+                  try:
+                      client = boto3.client("acm", region_name=region)
+                      paginator = client.get_paginator("list_certificates")
+
+                      for response in paginator.paginate():
+                          for cert in response["CertificateSummaryList"]:
+                              cert_arn = cert["CertificateArn"]
+                              cert_detail = client.describe_certificate(CertificateArn=cert_arn)
+                              expiration_date = cert_detail["Certificate"]["NotAfter"]
+                              now = datetime.datetime.now(datetime.timezone.utc)
+
+                              if expiration_date < now:
+                                  expired_certs.append(cert_arn)
+
+                      for cert_arn in expired_certs:
+                          cert_detail = client.describe_certificate(CertificateArn=cert_arn)
+                          in_use_by = cert_detail["Certificate"].get("InUseBy")
+                          if in_use_by:
+                              in_use_by = in_use_by[0]
+                              client_elbv2 = boto3.client("elbv2", region_name=region)
+                              response = client_elbv2.describe_listeners(LoadBalancerArn=in_use_by)
+                              for listener in response["Listeners"]:
+                                  try:
+                                      client_elbv2.remove_listener_certificates(
+                                          ListenerArn=listener["ListenerArn"],
+                                          Certificates=[
+                                              {
+                                                  'CertificateArn': cert_arn,
+                                              },
+                                          ]
+                                      )
+                                      print(f"The certificate {cert_arn} is in use by the load balancer {in_use_by}.")
+                                      print(f"The listener {listener['ListenerArn']} is using this certificate.")
+                                      print(f"The certificate {cert_arn} will be removed from the listener {listener['ListenerArn']}.")
+                                  except botocore.exceptions.ClientError as e:
+                                      error_code = e.response.get("Error", {}).get("Code")
+                                      if error_code == "OperationNotPermitted":
+                                          print(f"Error: {error_code} - Default certificate cannot be removed.")
+                                          print(f"Load Balancer ARN: {in_use_by}")
+                                          print(f"Certificate ARN: {cert_arn}")
+                                      else:
+                                          raise e
+                          else:
+                              print(f"The certificate {cert_arn} is not in use by any load balancer.")
+                  except botocore.exceptions.ClientError as e:
+                      error_code = e.response.get("Error", {}).get("Code")
+                      error_message = e.response.get("Error", {}).get("Message")
+                      print(f"Error occurred in region {region}: {error_code} - {error_message}")
+
+      
+      Description: Lambda Function to detach expired certificates from listeners
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      MemorySize: 128
+      Timeout: 600
+      Role: !GetAtt LambdaACMRole.Arn
+      FunctionName: DetachExpiredCertificates
+      
+  RemoveExpiredCerts:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+
+          def lambda_handler(event, context):
+              def get_all_regions():
+                  session = boto3.session.Session()
+                  return session.get_available_regions('acm')
+
+              def get_elb_arn(region):
+                  client = boto3.client("elbv2", region_name=region)
+                  response = client.describe_load_balancers()
+                  elb_arns = [lb["LoadBalancerArn"] for lb in response["LoadBalancers"]]
+                  return elb_arns
+
+              def publish_to_sns(topic_arn, subject, message):
+                  sns_client = boto3.client('sns')
+                  sns_client.publish(TopicArn=topic_arn, Subject=subject, Message=message)
+
+              regions = get_all_regions()
+              deleted_certs = []
+              expired_certs = []
+              topic_name = "OpsGenie-OpsTeam"
+              error_messages = []
+
+              sns_client = boto3.client('sns')
+              topic_arn = ""
+              response = sns_client.list_topics()
+
+              for topic in response['Topics']:
+                  if topic['TopicArn'].endswith(':' + topic_name):
+                      topic_arn = topic['TopicArn']
+                      break
+
+              if not topic_arn:
+                  print(f"SNS topic '{topic_name}' not found. Unable to publish failure message.")
+                  return
+
+              for region in regions:
+                  # Clear the expired_certs list before each region is iterated over.
+                  expired_certs.clear()
+
+                  client = boto3.client("acm", region_name=region)
+                  paginator = client.get_paginator("list_certificates")
+
+                  try:
+                      for response in paginator.paginate():
+                          for cert in response["CertificateSummaryList"]:
+                              cert_arn = cert["CertificateArn"]
+                              cert_detail = client.describe_certificate(CertificateArn=cert_arn)
+                              expiration_date = cert_detail["Certificate"]["NotAfter"]
+                              now = datetime.datetime.now(datetime.timezone.utc)
+
+                              if expiration_date < now:
+                                  expired_certs.append(cert_arn)
+
+                      if expired_certs:
+                          for cert_arn in expired_certs:
+                              if cert_arn in deleted_certs:
+                                  print(f"The certificate {cert_arn} has been deleted.")
+                              else:
+                                  print(f"The certificate {cert_arn} has expired on {expiration_date}. Deleting...")
+                                  # Comment the following line for testing without deleting certificates
+                                  client.delete_certificate(CertificateArn=cert_arn)
+                                  deleted_certs.append(cert_arn)
+                      else:
+                          # Only print this message if no certificates have been deleted.
+                          if not deleted_certs:
+                              print("No expired certificates found.")
+                  except Exception as e:
+                      error_message = f"An error occurred while processing region {region}: {e}"
+                      print(error_message)
+                      if isinstance(e, boto3.exceptions.botocore.client.ClientError) and e.response['Error']['Code'] == 'ResourceInUseException':
+                          elb_arns = get_elb_arn(region)
+                          if elb_arns:
+                              elb_arns_str = ", ".join(elb_arns)
+                              error_message += f" (ELB ARN: {elb_arns_str})"
+                          error_messages.append(error_message)
+
+              if error_messages:
+                  subject = "Failed to delete an expired SSL certificate"
+                  error_message = "\n".join(error_messages)
+                  publish_to_sns(topic_arn, subject, error_message)
+                  print(f"Published message to SNS topic: {error_message}")
+
+    
+      Description: Lambda Function to remove expired certificates from ACM
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      MemorySize: 128
+      Timeout: 600
+      Role: !GetAtt LambdaACMRole.Arn
+      FunctionName: RemoveExpiredCertificates
+
+  DetachExpiredCertsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(0 0 1 * ? *)"
+      Targets:
+        - Id: DetachExpiredCertsScheduler
+          Arn:
+            Fn::GetAtt:
+              - DetachExpiredCerts
+              - Arn
+
+  InvokeDetachLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - DetachExpiredCerts
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+          - DetachExpiredCertsRule
+          - Arn
+  
+  DetachExpiredCertsEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref DetachExpiredCerts
+      Qualifier: $LATEST
+      DestinationConfig:
+        OnSuccess:
+          Destination:
+            Fn::GetAtt:
+            - RemoveExpiredCerts
+            - Arn
+        OnFailure:
+          Destination:
+            Fn::GetAtt:
+            - RemoveExpiredCerts
+            - Arn
